@@ -1,0 +1,172 @@
+---
+title: "包头初三"
+author: "chenshuai"
+format: html
+editor: visual
+---
+
+# 0. Prepare
+
+## Load packages
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(dplyr)
+library(ggpubr)
+library(corrplot)
+library(gridExtra)
+library(lubridate)
+requireNamespace("bit64")
+source("./utils.R")
+```
+
+## Load data
+
+```{r}
+# load cognitive score
+Cogscore <- read_excel("./Data/初三测评.xlsx") |> 
+  mutate(生日 = ymd(出生日期)) |> select(生日,everything())
+Cogscore[,-c(1:6)] <- sapply(Cogscore[,-c(1:6)], as.numeric)
+
+# load exam score
+Examscore <- read_excel("./Data/初三成绩.xlsx") |> 
+  mutate(生日 = ymd(生日)) 
+
+# combine the two data
+data <- inner_join(Cogscore, Examscore, by = c("姓名","生日")) 
+```
+
+# 剔除异常数据
+
+```{r}
+# 剔除异常学校
+data <- data |> filter(所属机构 != c("石拐一中","土右民一中","包钢实验中学","包七中","包二十五中"))
+
+data <- data |>  select(c("姓名","生日","位置记忆Q版分数","变色魔块Q版分数","图形折叠QA版分数","城市导航QA版分数","社交达人QA版分数","魔术师终极QA版分数","语文","数学","英语","道德与法治","历史","物理","总分")) 
+```
+
+# plot distribution
+
+```{r}
+data |> select("语文":"物理") |> 
+  pivot_longer(cols=everything(),names_to = "学科",values_to = "成绩") |> 
+  ggplot()+geom_histogram(aes(x=成绩,y=after_stat(density)),binwidth = 5,alpha = 0.5)+facet_wrap(~学科,scales = "free")+theme_minimal()
+
+
+# assignedscore |> pivot_longer(cols = c("语文","数学","英语","政治"),names_to = "学科",values_to = "成绩") |> ggplot()+geom_histogram(aes(x=成绩,fill=学科),binwidth = 5,alpha = 0.5)+facet_wrap(~学科,scales = "free")
+
+counts <- data |> 
+  select(位置记忆Q版分数:魔术师终极QA版分数)  |> 
+  pivot_longer(cols = everything(), names_to = "游戏", values_to = "成绩") |> drop_na() |>
+  group_by(游戏) |> 
+  summarize(count = n())
+
+p <- data |> select(位置记忆Q版分数:魔术师终极QA版分数) |> 
+  pivot_longer(cols=everything(),names_to = "游戏",values_to = "成绩") |> drop_na() |>
+  ggplot()+geom_histogram(aes(x=成绩,y=..density..),bins=50,alpha = 0.5)+facet_wrap(~游戏,scales = "free")+
+  geom_text(data = counts, aes(label = count, x = Inf, y = Inf), vjust = 1.5, hjust = 1.1, color = "black")+theme_minimal()
+
+
+```
+
+# 1. 0th order correlation
+
+```{r}
+result_matrix <- cor(data[c(3:ncol(data))],use = "pairwise.complete.obs")
+```
+
+```{r, fig.width=20, fig.height=12}
+corr_subset <- result_matrix[7:(nrow(result_matrix)),1:6]
+mypal <- colorRampPalette(c("blue", "white", "red"))(n = 100)
+corrplot::corrplot(corr_subset, method = "color", type = "full", col.lim = c(-1,1),col = mypal,
+         tl.col = "black", tl.srt = 45, addCoef.col = "black")
+```
+
+```{r, fig.width=20, fig.height=12}
+corr_subset <- result_matrix[1:6,1:6]
+mypal <- colorRampPalette(c("blue", "white", "red"))(n = 100)
+corrplot(corr_subset, method = "color", type = "lower", col.lim = c(-1,1),col = mypal,
+         tl.col = "black", tl.srt = 45, addCoef.col = "black")
+```
+
+```{r, fig.width=20, fig.height=12}
+corr_subset <- result_matrix[7:(nrow(result_matrix)-1),7:(nrow(result_matrix)-1)]
+mypal <- colorRampPalette(c("blue", "white", "red"))(n = 100)
+corrplot(corr_subset, method = "color", type = "lower", col.lim = c(0,1),col = mypal,
+         tl.col = "black", tl.srt = 45, addCoef.col = "black")
+```
+
+# 总分多元回归模型
+
+```{r}
+scaled_data <- data
+scaled_data[,-c(1:2)] <- scale(scaled_data[,-c(1:2)])
+
+predictors <- colnames(data)[3:8]
+formula <- as.formula(paste("总分 ~", paste("`", predictors, "`", sep = "", collapse = " + ")))
+
+model <- lm(formula = formula,data = scaled_data)
+model_summary <- summary(model)
+r_squared <- model_summary$r.squared
+
+coefficients <- coef(model)[-1]
+coefficients_df <- data.frame(
+  Term = names(coefficients),
+  Coefficient = coefficients,
+  AbsCoefficient = abs(coefficients)
+)
+coefficients_df <- coefficients_df[order(-coefficients_df$AbsCoefficient), ]
+
+r_squared
+View(coefficients_df)
+```
+
+
+# 计算潜力分类
+
+```{r}
+# 计算预测分和潜力分
+data <-  predict_subscore(sub_score = data, subs = "总分", predictors = predictors)
+data$实际赋分 <- calculate_percentile_and_assign_score(data$总分)
+data$预测赋分 <- calculate_percentile_and_assign_score(data$总分_预测)
+
+filtered_data <- potential(data |> drop_na())
+
+filtered_data |> ggplot(aes(实际赋分,预测赋分,color = 潜力分类))+geom_jitter(size=2,alpha=.5,width=1,height =1)+geom_abline(intercept = 0,slope = 1)+scale_color_manual(values = c("亟待提升" = "#008080",                                                                                                                                      "后劲不足" = "#6699CC",
+                                "后劲较弱" = "#00BFFF",
+                                "总体一般" = "#66C7B4", 
+                                "后劲较弱" = "#A2D8DD",
+                                "加强后劲" = '#D1E8E2',
+                                "潜力较大" = '#FFC0CB',
+                                "总体良好" = '#FFC3A0',
+                                "潜力巨大" = '#FF69B4',
+                                "总体优秀" = '#D6336C'))+theme_bw()+
+  theme(axis.title = element_text(size = 28),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size=20),
+        axis.text = element_text(size = 20))
+```
+
+#分科预测
+
+```{r}
+subjects <- c("语文", "数学", "英语", "道德与法治","历史", "物理")
+predict_data <- predict_subscore(sub_score = filtered_data, subs = subjects, predictors = predictors)
+
+```
+
+# 存储
+
+```{r}
+data2save <- predict_data |>  select(姓名,生日,语文:总分,语文_预测:物理_预测,总分_预测,潜力分类) |>
+  mutate(across(语文_预测:物理_预测, ~ round(.,2))) 
+
+write_xlsx(data2save, "./Results/初三潜力分析.xlsx")
+
+
+```
+
